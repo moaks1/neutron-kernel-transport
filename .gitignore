@@ -1,0 +1,7 @@
+kdata/
+__pycache__/
+outputs/
+tests/
+.DS_Store
+.ipynb_checkpoints/
+kernels/
