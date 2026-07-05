@@ -1,4 +1,7 @@
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -42,6 +45,93 @@ def random_unit_vector(rng):
     if mag == 0.0:
         return np.array([1.0, 0.0])
     return direction / mag
+
+
+def resolve_worker_count(n_workers, n_tasks):
+    """Normalize notebook worker settings to a safe process count."""
+    n_tasks = int(n_tasks)
+    if n_tasks <= 1 or n_workers is None:
+        return 1
+
+    if isinstance(n_workers, str):
+        text = n_workers.strip().lower()
+        if text in {"auto", "all"}:
+            requested = os.cpu_count() or 1
+        else:
+            requested = int(text)
+    else:
+        requested = int(n_workers)
+
+    if requested <= 1:
+        return 1
+    return min(requested, n_tasks)
+
+
+def make_source_seeds(n_source_neutrons, random_seed):
+    """Return independent uint32 seeds for source histories in parallel mode."""
+    if random_seed is None:
+        seed_sequence = np.random.SeedSequence()
+    else:
+        seed_sequence = np.random.SeedSequence(int(random_seed))
+
+    child_sequences = seed_sequence.spawn(int(n_source_neutrons))
+    return [int(seq.generate_state(1, dtype=np.uint32)[0]) for seq in child_sequences]
+
+
+def kernel_payload_for_workers(kernel):
+    """Drop lazy flat-kernel views before sending a kernel to worker processes."""
+    if isinstance(kernel, dict) and kernel.get("flat_storage", False) and "bins" in kernel:
+        payload = dict(kernel)
+        payload.pop("bins", None)
+        return payload
+    return kernel
+
+
+_WORKER_MATERIAL = None
+_WORKER_KERNEL = None
+_WORKER_SETTINGS = None
+
+
+def many_source_worker_init(material, kernel, settings):
+    """Attach shared transport inputs once per worker process."""
+    global _WORKER_MATERIAL, _WORKER_KERNEL, _WORKER_SETTINGS
+    _WORKER_MATERIAL = material
+    _WORKER_KERNEL = kernel
+    _WORKER_SETTINGS = settings
+
+
+def run_one_source_worker(task):
+    """Run one source-neutron history inside a worker process."""
+    source_id, source_seed, starting_idx = task
+    settings = _WORKER_SETTINGS
+
+    if source_seed is not None:
+        np.random.seed(int(source_seed))
+
+    starting_neutron = SimpleNeutron(
+        energy_eV=settings["initial_energy_eV"],
+        x=settings["start_x"],
+        y=settings["start_y"],
+        direction=random_unit_vector_2d(),
+        box_size_m=settings["box_size_m"],
+        idx=int(starting_idx),
+        generation=0,
+        parent_idx=None,
+    )
+
+    source_neutrons = run_neutron_population_event_driven_material(
+        starting_neutron=starting_neutron,
+        material=_WORKER_MATERIAL,
+        max_events=settings["max_events_per_source"],
+        max_neutrons=settings["max_neutrons_per_source"],
+        kernel=_WORKER_KERNEL,
+    )
+
+    for neutron in source_neutrons:
+        for row in neutron.history:
+            row["source_id"] = int(source_id)
+
+    return source_neutrons
 
 
 def load_material_summary(material_file, xs_dir):
@@ -164,37 +254,74 @@ def run_many_source_neutrons(
     max_events_per_source=500,
     max_neutrons_per_source=500,
     kernel=None,
+    n_workers=1,
+    source_seeds=None,
 ):
     """Run many independent source-neutron histories."""
+    n_source = int(n_source_neutrons)
+    workers = resolve_worker_count(n_workers, n_source)
     all_neutrons = []
-    next_starting_idx = 0
 
-    for source_id in range(int(n_source_neutrons)):
-        starting_neutron = SimpleNeutron(
-            energy_eV=initial_energy_eV,
-            x=start_x,
-            y=start_y,
-            direction=random_unit_vector_2d(),
-            box_size_m=box_size_m,
-            idx=next_starting_idx,
-            generation=0,
-            parent_idx=None,
-        )
+    if workers <= 1:
+        next_starting_idx = 0
 
-        source_neutrons = run_neutron_population_event_driven_material(
-            starting_neutron=starting_neutron,
-            material=material,
-            max_events=max_events_per_source,
-            max_neutrons=max_neutrons_per_source,
-            kernel=kernel,
-        )
+        for source_id in range(n_source):
+            starting_neutron = SimpleNeutron(
+                energy_eV=initial_energy_eV,
+                x=start_x,
+                y=start_y,
+                direction=random_unit_vector_2d(),
+                box_size_m=box_size_m,
+                idx=next_starting_idx,
+                generation=0,
+                parent_idx=None,
+            )
 
-        for neutron in source_neutrons:
-            for row in neutron.history:
-                row["source_id"] = source_id
+            source_neutrons = run_neutron_population_event_driven_material(
+                starting_neutron=starting_neutron,
+                material=material,
+                max_events=max_events_per_source,
+                max_neutrons=max_neutrons_per_source,
+                kernel=kernel,
+            )
 
-        all_neutrons.extend(source_neutrons)
-        next_starting_idx = max(neutron.idx for neutron in all_neutrons) + 1
+            for neutron in source_neutrons:
+                for row in neutron.history:
+                    row["source_id"] = source_id
+
+            all_neutrons.extend(source_neutrons)
+            next_starting_idx = max(neutron.idx for neutron in all_neutrons) + 1
+
+        return all_neutrons
+
+    if source_seeds is None:
+        source_seeds = make_source_seeds(n_source, random_seed=None)
+
+    id_stride = max(int(max_neutrons_per_source), 1)
+    tasks = [
+        (source_id, source_seeds[source_id], source_id * id_stride)
+        for source_id in range(n_source)
+    ]
+    settings = {
+        "initial_energy_eV": float(initial_energy_eV),
+        "box_size_m": float(box_size_m),
+        "start_x": float(start_x),
+        "start_y": float(start_y),
+        "max_events_per_source": int(max_events_per_source),
+        "max_neutrons_per_source": int(max_neutrons_per_source),
+    }
+    chunksize = max(1, n_source // max(workers * 8, 1))
+    kernel_payload = kernel_payload_for_workers(kernel)
+
+    print(f"Running {n_source} source neutrons with {workers} worker processes.")
+
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=many_source_worker_init,
+        initargs=(material, kernel_payload, settings),
+    ) as executor:
+        for source_neutrons in executor.map(run_one_source_worker, tasks, chunksize=chunksize):
+            all_neutrons.extend(source_neutrons)
 
     return all_neutrons
 
@@ -211,12 +338,17 @@ def run_many_source_transport(
     random_seed=None,
     reset_cache=True,
     kernel=None,
+    n_workers=1,
 ):
     """Run many source neutrons and return neutrons, history DataFrame, and execution time."""
     set_random_seed(random_seed)
 
     if reset_cache and "_reaction_cache" in material:
         clear_material_reaction_cache(material)
+
+    n_source = int(n_source_neutrons)
+    workers = resolve_worker_count(n_workers, n_source)
+    source_seeds = make_source_seeds(n_source, random_seed) if workers > 1 else None
 
     start_time = time.perf_counter()
 
@@ -230,12 +362,15 @@ def run_many_source_transport(
         max_events_per_source=max_events_per_source,
         max_neutrons_per_source=max_neutrons_per_source,
         kernel=kernel,
+        n_workers=workers,
+        source_seeds=source_seeds,
     )
 
     hist_df = all_neutron_histories_dataframe(neutrons)
     execution_time = time.perf_counter() - start_time
 
     print("Source neutrons launched:", n_source_neutrons)
+    print("Worker processes:", workers)
     print("Total neutron objects including secondaries:", len(neutrons))
     print("Alive at end:", sum(neutron.alive for neutron in neutrons))
     if "source_id" in hist_df.columns:

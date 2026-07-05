@@ -16,7 +16,9 @@ missing MF6 data, photon/electron production, and some secondary-particle detail
 still fall back to runtime logic.
 """
 
+import hashlib
 import json
+import re
 from pathlib import Path
  
 import numpy as np
@@ -46,6 +48,53 @@ from mf6 import (
     mf6_law2_coeffs_at,
     get_target_A_from_threshold_curve,
 )
+
+
+def slugify_kernel_text(value, default="material"):
+    """Return a filesystem-safe lowercase label for kernel cache filenames."""
+    text = str(value).strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = text.strip("_")
+    return text or default
+
+
+def material_kernel_fingerprint(material, digest_chars=10):
+    """Build a short stable fingerprint from material density and isotope densities."""
+    pieces = [
+        str(material.get("name", "")),
+        f"density={float(material.get('density_g_cm3', 0.0)):.12e}",
+    ]
+
+    isotopes = material.get("isotopes", {})
+    for label in sorted(isotopes):
+        info = isotopes[label]
+        pieces.append(
+            f"{label}:"
+            f"nd={float(info.get('number_density_m3', 0.0)):.12e}:"
+            f"mf={float(info.get('mass_fraction', 0.0)):.12e}"
+        )
+
+    digest = hashlib.sha1("|".join(pieces).encode("utf-8")).hexdigest()
+    return digest[: int(digest_chars)]
+
+
+def material_kernel_label(material):
+    """Return a readable, material-specific label for kernel cache files."""
+    name = slugify_kernel_text(material.get("name", "material"))
+    fingerprint = material_kernel_fingerprint(material)
+    return f"{name}_{fingerprint}"
+
+
+def material_transport_kernel_filename(material, version="v1"):
+    """Return the default NPZ filename for a material transport kernel."""
+    label = material_kernel_label(material)
+    version = slugify_kernel_text(version, default="v1")
+    return f"material_transport_kernel_{label}_{version}.npz"
+
+
+def material_transport_kernel_path(kernel_dir, material, version="v1"):
+    """Return the default material-specific kernel cache path."""
+    return Path(kernel_dir) / material_transport_kernel_filename(material, version=version)
 
 
 def cdf_from_pdf_grid(x, pdf):
@@ -1140,6 +1189,8 @@ def build_material_transport_kernel(
     kernel = {
         "kind": "material_reaction_kernel_v1",
         "material_name": material.get("name", "unknown material"),
+        "material_kernel_label": material_kernel_label(material),
+        "material_fingerprint": material_kernel_fingerprint(material),
         "E_min_eV": float(E_min_eV),
         "E_max_eV": float(E_max_eV),
         "bins_per_decade": int(bins_per_decade),
@@ -1594,6 +1645,8 @@ def save_material_transport_kernel_npz(kernel, path):
     metadata = {
         "kind": kernel.get("kind", "material_reaction_kernel_v1"),
         "material_name": kernel.get("material_name", "unknown material"),
+        "material_kernel_label": kernel.get("material_kernel_label", ""),
+        "material_fingerprint": kernel.get("material_fingerprint", ""),
         "E_min_eV": float(kernel["E_min_eV"]),
         "E_max_eV": float(kernel["E_max_eV"]),
         "bins_per_decade": int(kernel["bins_per_decade"]),
@@ -1698,6 +1751,15 @@ def load_material_transport_kernel_npz(path, material):
 
     metadata = json.loads(str(data["metadata_json"]))
 
+    saved_fingerprint = metadata.get("material_fingerprint", "")
+    if saved_fingerprint:
+        current_fingerprint = material_kernel_fingerprint(material)
+        if str(saved_fingerprint) != str(current_fingerprint):
+            raise ValueError(
+                "Kernel material fingerprint does not match the loaded material. "
+                f"kernel={saved_fingerprint}, material={current_fingerprint}"
+            )
+
     energy_edges_eV = np.array(data["energy_edges_eV"], dtype=float)
     energy_centers_eV = np.array(data["energy_centers_eV"], dtype=float)
 
@@ -1801,6 +1863,8 @@ def load_material_transport_kernel_npz(path, material):
         "kind": metadata.get("kind", "material_reaction_kernel_v1"),
         "flat_storage": True,
         "material_name": metadata.get("material_name", material.get("name", "unknown material")),
+        "material_kernel_label": metadata.get("material_kernel_label", ""),
+        "material_fingerprint": metadata.get("material_fingerprint", ""),
         "E_min_eV": float(metadata["E_min_eV"]),
         "E_max_eV": float(metadata["E_max_eV"]),
         "bins_per_decade": int(metadata["bins_per_decade"]),

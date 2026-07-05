@@ -33,6 +33,8 @@ The kernel does not precompute neutron histories and it does not make the simula
 
 * Event-driven analog Monte Carlo neutron transport
 * Precomputed material transport kernel for fast collision sampling
+* Material-specific kernel cache names with composition fingerprints
+* Notebook-controlled many-source parallel workers with `N_WORKERS`
 * Single-source and many-source neutron modes in one notebook
 * Homogeneous 2D square material geometry
 * Material composition from Python material files
@@ -77,7 +79,7 @@ Kernel_Based_MC_NT/
         Concrete.py
 
     kernels/
-        material_transport_kernel_v1.npz
+        material_transport_kernel_<material-label>_<fingerprint>_v1.npz
 
     outputs/
         transport_history.csv
@@ -160,12 +162,13 @@ For many-source mode:
 
 ```python
 N_SOURCE_NEUTRONS = 100
+N_WORKERS = 1              # Serial. Use an integer > 1 for process workers, or "auto".
 MAX_EVENTS_PER_SOURCE = 500
 MAX_NEUTRONS_PER_SOURCE = 50
 MAX_TRAJECTORY_PATHS = 80
 ```
 
-For early testing, keep many-source values small. Large many-source runs can produce large transport-history CSV files.
+For early testing, keep many-source values small. Large many-source runs can produce large transport-history CSV files. `N_WORKERS = 1` keeps the run serial. Larger integer values split independent source-neutron histories across worker processes.
 
 ## Transport Kernel
 
@@ -200,17 +203,30 @@ secondary-neutron creation
 history logging
 ```
 
-The default kernel path is:
+The notebook now builds the kernel cache path from the loaded material:
+
+```python
+KERNEL_NPZ_PATH = material_transport_kernel_path(
+    kernel_dir=KERNEL_DIR,
+    material=material,
+    version=KERNEL_VERSION,
+)
+```
+
+The resulting filename includes a readable material label and a short composition fingerprint:
 
 ```text
-kernels/material_transport_kernel_v1.npz
+kernels/material_transport_kernel_<material-label>_<fingerprint>_v1.npz
 ```
+
+That keeps `Steel`, `Concrete`, and future materials from accidentally sharing one kernel file. If the material density or isotope number densities change, the fingerprint changes too. Loaded kernels with stored fingerprints are rejected if they do not match the currently loaded material.
 
 Important kernel controls:
 
 ```python
 USE_TRANSPORT_KERNEL = True
 LOAD_KERNEL_IF_EXISTS = True
+KERNEL_VERSION = "v1"
 KERNEL_E_MIN_EV = 1.0e-5
 KERNEL_E_MAX_EV = 2.0e7
 KERNEL_BINS_PER_DECADE = 100
@@ -393,6 +409,7 @@ Kernel controls:
 ```python
 USE_TRANSPORT_KERNEL = True
 LOAD_KERNEL_IF_EXISTS = True
+KERNEL_VERSION = "v1"
 KERNEL_E_MIN_EV = 1.0e-5
 KERNEL_E_MAX_EV = 2.0e7
 KERNEL_BINS_PER_DECADE = 100
@@ -571,7 +588,7 @@ Important simplifications include:
 * Doppler broadening is not included
 * Material self-shielding is not fully treated
 * Nuclear data must already be processed into the expected `.npz` format
-* Kernel data are material- and settings-specific
+* Kernel data are material- and settings-specific; cache filenames include the material label and composition fingerprint
 * Unsupported MF6 laws and missing MF6 data use fallback runtime behavior
 * Direction transport is still 2D
 * MF6 LAW=2 angles are projected into the 2D transport model
