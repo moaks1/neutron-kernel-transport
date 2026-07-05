@@ -931,7 +931,8 @@ def material_from_composition_file(material_file, xs_dir):
     material = {
         "name": label,
         "density_g_cm3": density_g_cm3,
-        "source_file": material_file,
+        "source_file": str(material_file),
+        "xs_dir": str(xs_dir),
         "isotopes": {},
         "missing_xs_files": [],
     }

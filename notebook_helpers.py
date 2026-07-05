@@ -1,6 +1,7 @@
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -30,12 +31,38 @@ from decay_activity import (
     direct_activity_curves_from_history,
     evolve_decay_chains_from_history,
 )
+from transport_kernel import load_material_transport_kernel_npz
 
 
 def set_random_seed(random_seed):
     """Seed NumPy's global random generator used by the transport code."""
     if random_seed is not None:
         np.random.seed(int(random_seed))
+
+
+def output_plot_path(save_name, output_dir="outputs"):
+    """Resolve relative plot filenames under the output directory."""
+    if save_name is None:
+        return None
+
+    path = Path(save_name)
+    if not path.is_absolute():
+        output_dir = Path(output_dir)
+        if len(path.parts) == 0 or path.parts[0] != output_dir.name:
+            path = output_dir / path
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def save_figure_to_output(fig, save_name, dpi=300, bbox_inches="tight"):
+    """Save a figure, routing bare relative PNG names into outputs/."""
+    save_path = output_plot_path(save_name)
+    if save_path is None:
+        return None
+
+    fig.savefig(save_path, dpi=dpi, bbox_inches=bbox_inches)
+    return save_path
 
 
 def random_unit_vector(rng):
@@ -78,25 +105,35 @@ def make_source_seeds(n_source_neutrons, random_seed):
     return [int(seq.generate_state(1, dtype=np.uint32)[0]) for seq in child_sequences]
 
 
-def kernel_payload_for_workers(kernel):
-    """Drop lazy flat-kernel views before sending a kernel to worker processes."""
-    if isinstance(kernel, dict) and kernel.get("flat_storage", False) and "bins" in kernel:
-        payload = dict(kernel)
-        payload.pop("bins", None)
-        return payload
-    return kernel
-
 
 _WORKER_MATERIAL = None
 _WORKER_KERNEL = None
 _WORKER_SETTINGS = None
 
 
-def many_source_worker_init(material, kernel, settings):
-    """Attach shared transport inputs once per worker process."""
+def many_source_worker_init(worker_inputs, settings):
+    """Attach worker-local material and kernel inputs once per process."""
     global _WORKER_MATERIAL, _WORKER_KERNEL, _WORKER_SETTINGS
-    _WORKER_MATERIAL = material
-    _WORKER_KERNEL = kernel
+
+    material_file = worker_inputs.get("material_file")
+    xs_dir = worker_inputs.get("xs_dir")
+    if material_file is not None and xs_dir is not None:
+        _WORKER_MATERIAL = material_from_composition_file(
+            material_file=material_file,
+            xs_dir=xs_dir,
+        )
+    else:
+        _WORKER_MATERIAL = worker_inputs.get("material")
+
+    kernel_path = worker_inputs.get("kernel_path")
+    if kernel_path is not None:
+        _WORKER_KERNEL = load_material_transport_kernel_npz(
+            path=kernel_path,
+            material=_WORKER_MATERIAL,
+        )
+    else:
+        _WORKER_KERNEL = worker_inputs.get("kernel")
+
     _WORKER_SETTINGS = settings
 
 
@@ -256,6 +293,9 @@ def run_many_source_neutrons(
     kernel=None,
     n_workers=1,
     source_seeds=None,
+    material_file=None,
+    xs_dir=None,
+    kernel_path=None,
 ):
     """Run many independent source-neutron histories."""
     n_source = int(n_source_neutrons)
@@ -294,6 +334,26 @@ def run_many_source_neutrons(
 
         return all_neutrons
 
+    if material_file is None and isinstance(material, dict):
+        material_file = material.get("source_file")
+    if xs_dir is None and isinstance(material, dict):
+        xs_dir = material.get("xs_dir")
+    if kernel_path is None and isinstance(kernel, dict):
+        kernel_path = kernel.get("source_path")
+
+    if material_file is None or xs_dir is None:
+        raise ValueError(
+            "Parallel many-source mode requires material_file and xs_dir so "
+            "worker processes can load their own nuclear-data files. Rerun the "
+            "material-loading cell so the material carries its source paths."
+        )
+    if kernel is not None and kernel_path is None:
+        raise ValueError(
+            "Parallel many-source mode with a transport kernel requires kernel_path "
+            "so workers can load the kernel locally instead of pickling open NPZ files. "
+            "Rerun the kernel-loading cell so the kernel carries its source path."
+        )
+
     if source_seeds is None:
         source_seeds = make_source_seeds(n_source, random_seed=None)
 
@@ -311,14 +371,18 @@ def run_many_source_neutrons(
         "max_neutrons_per_source": int(max_neutrons_per_source),
     }
     chunksize = max(1, n_source // max(workers * 8, 1))
-    kernel_payload = kernel_payload_for_workers(kernel)
+    worker_inputs = {
+        "material_file": str(material_file),
+        "xs_dir": str(xs_dir),
+        "kernel_path": str(kernel_path) if kernel_path is not None else None,
+    }
 
     print(f"Running {n_source} source neutrons with {workers} worker processes.")
 
     with ProcessPoolExecutor(
         max_workers=workers,
         initializer=many_source_worker_init,
-        initargs=(material, kernel_payload, settings),
+        initargs=(worker_inputs, settings),
     ) as executor:
         for source_neutrons in executor.map(run_one_source_worker, tasks, chunksize=chunksize):
             all_neutrons.extend(source_neutrons)
@@ -339,6 +403,9 @@ def run_many_source_transport(
     reset_cache=True,
     kernel=None,
     n_workers=1,
+    material_file=None,
+    xs_dir=None,
+    kernel_path=None,
 ):
     """Run many source neutrons and return neutrons, history DataFrame, and execution time."""
     set_random_seed(random_seed)
@@ -348,6 +415,13 @@ def run_many_source_transport(
 
     n_source = int(n_source_neutrons)
     workers = resolve_worker_count(n_workers, n_source)
+    if workers > 1:
+        if material_file is None and isinstance(material, dict):
+            material_file = material.get("source_file")
+        if xs_dir is None and isinstance(material, dict):
+            xs_dir = material.get("xs_dir")
+        if kernel_path is None and isinstance(kernel, dict):
+            kernel_path = kernel.get("source_path")
     source_seeds = make_source_seeds(n_source, random_seed) if workers > 1 else None
 
     start_time = time.perf_counter()
@@ -364,6 +438,9 @@ def run_many_source_transport(
         kernel=kernel,
         n_workers=workers,
         source_seeds=source_seeds,
+        material_file=material_file,
+        xs_dir=xs_dir,
+        kernel_path=kernel_path,
     )
 
     hist_df = all_neutron_histories_dataframe(neutrons)
@@ -423,7 +500,7 @@ def plot_neutron_trajectories(
     save_name="neutron_traj.png",
     show_labels=True,
 ):
-    """Plot neutron trajectories in the x-y plane and save in the current folder."""
+    """Plot neutron trajectories in the x-y plane and save under outputs/."""
     if max_paths is None:
         selected_neutrons = list(neutrons)
     else:
@@ -463,7 +540,7 @@ def plot_neutron_trajectories(
     ax.legend()
 
     if save_name is not None:
-        fig.savefig(save_name, dpi=300, bbox_inches="tight")
+        save_figure_to_output(fig, save_name)
 
     plt.show()
     return fig, ax
@@ -702,7 +779,7 @@ def plot_total_activity_auto(activity_df, y_col="total_Ci", ylabel="total activi
     ax.grid(True, alpha=0.3, which="both")
 
     if save_name is not None:
-        fig.savefig(save_name, dpi=300, bbox_inches="tight")
+        save_figure_to_output(fig, save_name)
 
     plt.show()
     return fig, ax
@@ -744,7 +821,7 @@ def plot_isotope_activities_auto(activity_df, unit="Bq", save_name=None):
     ax.legend()
 
     if save_name is not None:
-        fig.savefig(save_name, dpi=300, bbox_inches="tight")
+        save_figure_to_output(fig, save_name)
 
     plt.show()
     return fig, ax

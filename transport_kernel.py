@@ -1658,6 +1658,8 @@ def save_material_transport_kernel_npz(kernel, path):
         "mf6_mu_grid_count": int(kernel.get("mf6_mu_grid_count", 801)),
     }
 
+    kernel["source_path"] = str(path)
+
     np.savez_compressed(
         path,
         metadata_json=np.array(json.dumps(metadata)),
@@ -1865,6 +1867,7 @@ def load_material_transport_kernel_npz(path, material):
         "material_name": metadata.get("material_name", material.get("name", "unknown material")),
         "material_kernel_label": metadata.get("material_kernel_label", ""),
         "material_fingerprint": metadata.get("material_fingerprint", ""),
+        "source_path": str(path),
         "E_min_eV": float(metadata["E_min_eV"]),
         "E_max_eV": float(metadata["E_max_eV"]),
         "bins_per_decade": int(metadata["bins_per_decade"]),
