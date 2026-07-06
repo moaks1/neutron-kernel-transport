@@ -10,10 +10,6 @@ Current kernel layers:
     - precompute MF4 elastic angular CDFs for MT=2 when available
     - precompute MF6 outgoing-neutron energy/angle kernels for supported
       LAW=1 and LAW=2 data
-
-This does not yet kernelize every possible ENDF distribution. Unsupported MF6 laws,
-missing MF6 data, photon/electron production, and some secondary-particle details
-still fall back to runtime logic.
 """
 
 import hashlib

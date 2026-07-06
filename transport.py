@@ -1,5 +1,5 @@
 """
-Analog event-driven neutron transport.
+Analog kernel-based event-driven neutron transport.
 
 This module handles:
     - SimpleNeutron class
